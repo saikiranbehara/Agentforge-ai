@@ -26,6 +26,24 @@ public class AgentExecutionController {
         return ResponseEntity.ok(projectService.executeProject(id, userId));
     }
 
+    @PostMapping("/start")
+    public ResponseEntity<ProjectResponse> startProject(@PathVariable Long id) {
+        Long userId = securityUtils.getCurrentUserId();
+        return ResponseEntity.ok(projectService.executeProject(id, userId));
+    }
+
+    @PostMapping("/pause")
+    public ResponseEntity<ProjectResponse> pauseProject(@PathVariable Long id) {
+        Long userId = securityUtils.getCurrentUserId();
+        return ResponseEntity.ok(projectService.pauseProject(id, userId));
+    }
+
+    @PostMapping("/resume")
+    public ResponseEntity<ProjectResponse> resumeProject(@PathVariable Long id) {
+        Long userId = securityUtils.getCurrentUserId();
+        return ResponseEntity.ok(projectService.resumeProject(id, userId));
+    }
+
     @GetMapping("/agents")
     public ResponseEntity<List<AgentExecutionResponse>> getProjectAgents(@PathVariable Long id) {
         return ResponseEntity.ok(executionService.getProjectExecutions(id));

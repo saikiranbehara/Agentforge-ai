@@ -86,6 +86,20 @@ public class ProjectService {
     }
 
     @Transactional
+    public ProjectResponse pauseProject(Long projectId, Long userId) {
+        Project project = projectRepository.findByIdAndUserId(projectId, userId)
+                .orElseThrow(() -> new ResourceNotFoundException("Project not found: " + projectId));
+
+        orchestrator.pauseWorkflow(projectId);
+        return mapToResponse(project);
+    }
+
+    @Transactional
+    public ProjectResponse resumeProject(Long projectId, Long userId) {
+        return executeProject(projectId, userId);
+    }
+
+    @Transactional
     public ProjectResponse approveRequirements(Long projectId, Long userId, ApprovalRequest approval) {
         Project project = projectRepository.findByIdAndUserId(projectId, userId)
                 .orElseThrow(() -> new ResourceNotFoundException("Project not found: " + projectId));

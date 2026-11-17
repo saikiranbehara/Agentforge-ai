@@ -1,6 +1,7 @@
 package com.agentforge.ai.orchestrator;
 
 import com.agentforge.ai.agent.*;
+import com.agentforge.ai.agent.dto.*;
 import com.agentforge.ai.model.*;
 import com.agentforge.entity.*;
 import com.agentforge.repository.*;
@@ -8,6 +9,7 @@ import com.agentforge.service.SseNotificationService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -17,6 +19,16 @@ import java.util.*;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
 
+/**
+ * Central Multi-Agent Orchestrator for AgentForge.
+ * Coordinates all 7 AI agents in a stateful Directed Acyclic Graph (DAG) with:
+ * - Structured DTO passing between agents
+ * - Persistent execution history in PostgreSQL
+ * - Human-in-the-loop approval checkpoints (Requirements & Architecture)
+ * - Self-healing code repair feedback loop with configurable retries
+ * - Infinite loop guards & concurrency locks
+ * - Real-time Server-Sent Events (SSE) telemetry broadcast to React dashboard
+ */
 @Slf4j
 @Service
 @RequiredArgsConstructor
@@ -41,218 +53,468 @@ public class AgentOrchestrator {
     private final SseNotificationService sseService;
     private final ObjectMapper objectMapper;
 
-    private static final int MAX_SELF_HEALING_RETRIES = 2;
+    @Value("${agentforge.orchestrator.max-self-healing-retries:2}")
+    private int maxSelfHealingRetries = 2;
 
-    // Track active running projects to prevent duplicate concurrent runs
+    @Value("${agentforge.orchestrator.max-agent-retries:2}")
+    private int maxAgentRetries = 2;
+
+    @Value("${agentforge.orchestrator.require-requirements-approval:true}")
+    private boolean requireRequirementsApproval = true;
+
+    @Value("${agentforge.orchestrator.require-architecture-approval:true}")
+    private boolean requireArchitectureApproval = true;
+
+    private static final int MAX_GLOBAL_CIRCUIT_BREAKER_STEPS = 25;
+
+    // Concurrency guard: Ensures only one workflow execution thread per project
     private final Set<Long> runningProjects = ConcurrentHashMap.newKeySet();
+    private final Set<Long> pausedProjects = ConcurrentHashMap.newKeySet();
 
+    /**
+     * Entry point to launch or resume multi-agent workflow asynchronously.
+     */
     @Async
     public CompletableFuture<Void> runWorkflowAsync(Long projectId) {
         if (!runningProjects.add(projectId)) {
-            log.warn("Project {} is already executing an active workflow.", projectId);
+            log.warn("[AgentOrchestrator] Project {} is already actively running. Skipping duplicate execution request.", projectId);
             return CompletableFuture.completedFuture(null);
         }
 
+        pausedProjects.remove(projectId);
+
         try {
-            executeWorkflow(projectId);
+            executeWorkflowPipeline(projectId);
         } catch (Exception e) {
-            log.error("Fatal error during workflow execution for project {}", projectId, e);
-            markProjectFailed(projectId, e.getMessage());
+            log.error("[AgentOrchestrator] Fatal unhandled error executing workflow for project {}", projectId, e);
+            markProjectFailed(projectId, "Pipeline error: " + e.getMessage());
         } finally {
             runningProjects.remove(projectId);
         }
+
         return CompletableFuture.completedFuture(null);
     }
 
-    private void executeWorkflow(Long projectId) {
+    /**
+     * Pause execution of a running project workflow.
+     */
+    public void pauseWorkflow(Long projectId) {
+        log.info("[AgentOrchestrator] Pausing workflow for project: {}", projectId);
+        pausedProjects.add(projectId);
+        projectRepository.findById(projectId).ifPresent(p -> {
+            p.setStatus("PAUSED");
+            projectRepository.save(p);
+            broadcastStatus(p, p.getCurrentAgent() != null ? p.getCurrentAgent() : "ORCHESTRATOR", "PAUSED", p.getProgressPercentage(), "Workflow paused by user.");
+        });
+    }
+
+    /**
+     * Central state machine execution loop.
+     */
+    private void executeWorkflowPipeline(Long projectId) {
         Project project = projectRepository.findById(projectId)
-                .orElseThrow(() -> new RuntimeException("Project not found: " + projectId));
+                .orElseThrow(() -> new IllegalArgumentException("Project not found: " + projectId));
+
+        log.info("[AgentOrchestrator] Starting multi-agent pipeline for project {} ('{}')", projectId, project.getProjectName());
 
         AgentContext context = buildAgentContext(project);
+        int totalStepCounter = 0;
 
-        // ==========================================
-        // STAGE 1: REQUIREMENT ANALYST
-        // ==========================================
+        // =========================================================================
+        // AGENT 1: REQUIREMENT ANALYST
+        // =========================================================================
         if (context.getRequirementSpec() == null) {
-            updateProjectStatus(project, "ANALYZING", "REQUIREMENT_ANALYST", 10);
-            AgentExecutionResult reqResult = runAgentStep(project, requirementAnalyst, context, "Analyzing user requirements and extracting modules...");
+            if (checkIfPaused(projectId)) return;
 
-            if (!reqResult.isSuccess()) {
-                markProjectFailed(project.getId(), "Requirement analysis failed: " + reqResult.getErrorMessage());
+            updateProjectState(project, "ANALYZING_REQUIREMENTS", "REQUIREMENT_ANALYST", 10);
+            broadcastWorkflow(project, "REQUIREMENT_ANALYST", "RUNNING", 10, "Analyzing natural language requirements and user stories...");
+
+            RequirementAnalysisInput input = RequirementAnalysisInput.builder()
+                    .projectId(project.getId())
+                    .projectName(project.getProjectName())
+                    .naturalLanguageRequirements(project.getRequirements())
+                    .techStackPreference(String.format("Backend: %s, Frontend: %s, Database: %s",
+                            project.getBackendFramework(), project.getFrontendFramework(), project.getDatabaseType()))
+                    .feedbackMessage(context.getFeedbackMessage())
+                    .build();
+
+            RequirementAnalysisOutput output = executeWithRetry("REQUIREMENT_ANALYST", () -> requirementAnalyst.analyzeRequirements(input));
+
+            if (!output.isSuccess() || output.getRequirementSpec() == null) {
+                markProjectFailed(project.getId(), "Requirement analysis failed: " + output.getErrorMessage());
                 return;
             }
 
-            try {
-                RequirementSpec spec = objectMapper.readValue(reqResult.getOutputData(), RequirementSpec.class);
-                context.setRequirementSpec(spec);
-            } catch (Exception e) {
-                log.warn("Could not parse requirement spec JSON: {}", e.getMessage());
-            }
+            context.setRequirementSpec(output.getRequirementSpec());
+            persistExecutionHistory(project, "REQUIREMENT_ANALYST", "Requirement Analyst", input, output, output.isSuccess(),
+                    output.getSummary(), output.getExecutionDurationMs(), output.getErrorMessage());
 
-            // Pause if user approval required before architecture
-            if (Boolean.FALSE.equals(project.getRequirementsApproved())) {
-                project.setStatus("PENDING_REQUIREMENTS_APPROVAL");
-                project.setCurrentAgent("REQUIREMENT_ANALYST");
-                projectRepository.save(project);
-                broadcastStatus(project, "REQUIREMENT_ANALYST", "WAITING_APPROVAL", 20, "Waiting for user to review and approve requirements");
-                return;
+            broadcastWorkflow(project, "REQUIREMENT_ANALYST", "COMPLETED", 20, output.getSummary());
+
+            // Checkpoint 1: Human-in-the-Loop Requirements Approval
+            if (requireRequirementsApproval && !Boolean.TRUE.equals(project.getRequirementsApproved())) {
+                log.info("[AgentOrchestrator] Halting at Human-in-the-Loop Checkpoint: Requirements Approval needed for project {}", project.getId());
+                updateProjectState(project, "PENDING_REQUIREMENTS_APPROVAL", "REQUIREMENT_ANALYST", 20);
+                broadcastStatus(project, "REQUIREMENT_ANALYST", "WAITING_APPROVAL", 20, "Requirements synthesized. Awaiting user approval to proceed with Architecture.");
+                return; // Stop pipeline until human approves
             }
         }
 
-        // ==========================================
-        // STAGE 2: SYSTEM ARCHITECT
-        // ==========================================
+        // =========================================================================
+        // AGENT 2: SYSTEM ARCHITECT
+        // =========================================================================
         if (context.getArchitectureSpec() == null) {
-            updateProjectStatus(project, "ARCHITECTING", "SYSTEM_ARCHITECT", 25);
-            AgentExecutionResult archResult = runAgentStep(project, systemArchitect, context, "Designing relational schema, REST endpoints, and system architecture...");
+            if (checkIfPaused(projectId)) return;
 
-            if (!archResult.isSuccess()) {
-                markProjectFailed(project.getId(), "System architecture design failed: " + archResult.getErrorMessage());
+            updateProjectState(project, "DESIGNING_ARCHITECTURE", "SYSTEM_ARCHITECT", 30);
+            broadcastWorkflow(project, "SYSTEM_ARCHITECT", "RUNNING", 30, "Designing relational database schemas, REST APIs, and architecture...");
+
+            SystemArchitectInput input = SystemArchitectInput.builder()
+                    .projectId(project.getId())
+                    .projectName(project.getProjectName())
+                    .requirementSpec(context.getRequirementSpec())
+                    .preferredBackend(project.getBackendFramework())
+                    .preferredFrontend(project.getFrontendFramework())
+                    .preferredDatabase(project.getDatabaseType())
+                    .feedbackMessage(context.getFeedbackMessage())
+                    .build();
+
+            SystemArchitectOutput output = executeWithRetry("SYSTEM_ARCHITECT", () -> systemArchitect.designArchitecture(input));
+
+            if (!output.isSuccess() || output.getArchitectureSpec() == null) {
+                markProjectFailed(project.getId(), "System Architecture design failed: " + output.getErrorMessage());
                 return;
             }
 
-            try {
-                SystemArchitectureSpec spec = objectMapper.readValue(archResult.getOutputData(), SystemArchitectureSpec.class);
-                context.setArchitectureSpec(spec);
-            } catch (Exception e) {
-                log.warn("Could not parse architecture spec JSON: {}", e.getMessage());
-            }
+            context.setArchitectureSpec(output.getArchitectureSpec());
+            persistExecutionHistory(project, "SYSTEM_ARCHITECT", "System Architect", input, output, output.isSuccess(),
+                    output.getSummary(), output.getExecutionDurationMs(), output.getErrorMessage());
 
-            // Pause if user approval required before code generation
-            if (Boolean.FALSE.equals(project.getArchitectureApproved())) {
-                project.setStatus("PENDING_ARCHITECTURE_APPROVAL");
-                project.setCurrentAgent("SYSTEM_ARCHITECT");
-                projectRepository.save(project);
-                broadcastStatus(project, "SYSTEM_ARCHITECT", "WAITING_APPROVAL", 35, "Waiting for user to review and approve system architecture");
-                return;
+            broadcastWorkflow(project, "SYSTEM_ARCHITECT", "COMPLETED", 40, output.getSummary());
+
+            // Checkpoint 2: Human-in-the-Loop Architecture Approval
+            if (requireArchitectureApproval && !Boolean.TRUE.equals(project.getArchitectureApproved())) {
+                log.info("[AgentOrchestrator] Halting at Human-in-the-Loop Checkpoint: Architecture Approval needed for project {}", project.getId());
+                updateProjectState(project, "PENDING_ARCHITECTURE_APPROVAL", "SYSTEM_ARCHITECT", 40);
+                broadcastStatus(project, "SYSTEM_ARCHITECT", "WAITING_APPROVAL", 40, "Architecture and database schema designed. Awaiting user approval to generate code.");
+                return; // Stop pipeline until human approves
             }
         }
 
-        // ==========================================
-        // STAGE 3 & 4: PARALLEL BACKEND & FRONTEND CODE GENERATION
-        // ==========================================
-        updateProjectStatus(project, "GENERATING", "BACKEND_DEVELOPER", 45);
+        // =========================================================================
+        // AGENT 3 & 4: PARALLEL BACKEND & FRONTEND CODE GENERATION
+        // =========================================================================
+        if (checkIfPaused(projectId)) return;
 
-        // Run Backend Developer
-        AgentExecutionResult beResult = runAgentStep(project, backendDeveloper, context, "Generating Spring Boot entities, repositories, services, and controllers...");
-        if (beResult.isSuccess() && beResult.getFiles() != null) {
-            saveGeneratedFiles(project, beResult.getFiles(), "BACKEND_DEVELOPER");
+        // Stage 3: Backend Developer
+        updateProjectState(project, "GENERATING_BACKEND", "BACKEND_DEVELOPER", 50);
+        broadcastWorkflow(project, "BACKEND_DEVELOPER", "RUNNING", 50, "Generating Spring Boot 3.3 / Java 21 entities, repositories, services, and controllers...");
+
+        BackendDeveloperInput beInput = BackendDeveloperInput.builder()
+                .projectId(project.getId())
+                .projectName(project.getProjectName())
+                .requirementSpec(context.getRequirementSpec())
+                .architectureSpec(context.getArchitectureSpec())
+                .build();
+
+        BackendDeveloperOutput beOutput = executeWithRetry("BACKEND_DEVELOPER", () -> backendDeveloper.generateBackend(beInput));
+
+        if (!beOutput.isSuccess()) {
+            markProjectFailed(project.getId(), "Backend code generation failed: " + beOutput.getErrorMessage());
+            return;
         }
 
-        updateProjectStatus(project, "GENERATING", "FRONTEND_DEVELOPER", 60);
+        saveGeneratedFiles(project, beOutput.getFiles(), "BACKEND_DEVELOPER");
+        persistExecutionHistory(project, "BACKEND_DEVELOPER", "Backend Developer", beInput, beOutput, beOutput.isSuccess(),
+                beOutput.getSummary(), beOutput.getExecutionDurationMs(), beOutput.getErrorMessage());
 
-        // Run Frontend Developer
-        AgentExecutionResult feResult = runAgentStep(project, frontendDeveloper, context, "Generating React TypeScript components, styling, and API services...");
-        if (feResult.isSuccess() && feResult.getFiles() != null) {
-            saveGeneratedFiles(project, feResult.getFiles(), "FRONTEND_DEVELOPER");
+        broadcastWorkflow(project, "BACKEND_DEVELOPER", "COMPLETED", 60, beOutput.getSummary());
+
+        if (checkIfPaused(projectId)) return;
+
+        // Stage 4: Frontend Developer
+        updateProjectState(project, "GENERATING_FRONTEND", "FRONTEND_DEVELOPER", 65);
+        broadcastWorkflow(project, "FRONTEND_DEVELOPER", "RUNNING", 65, "Generating React 18 / TypeScript / Tailwind CSS pages and API client services...");
+
+        FrontendDeveloperInput feInput = FrontendDeveloperInput.builder()
+                .projectId(project.getId())
+                .projectName(project.getProjectName())
+                .requirementSpec(context.getRequirementSpec())
+                .architectureSpec(context.getArchitectureSpec())
+                .build();
+
+        FrontendDeveloperOutput feOutput = executeWithRetry("FRONTEND_DEVELOPER", () -> frontendDeveloper.generateFrontend(feInput));
+
+        if (!feOutput.isSuccess()) {
+            markProjectFailed(project.getId(), "Frontend code generation failed: " + feOutput.getErrorMessage());
+            return;
         }
 
-        // Refresh context with generated files from database
-        context.setGeneratedFiles(fileRepository.findByProjectIdAndIsLatestTrueOrderByFilePathAsc(project.getId()));
+        saveGeneratedFiles(project, feOutput.getFiles(), "FRONTEND_DEVELOPER");
+        persistExecutionHistory(project, "FRONTEND_DEVELOPER", "Frontend Developer", feInput, feOutput, feOutput.isSuccess(),
+                feOutput.getSummary(), feOutput.getExecutionDurationMs(), feOutput.getErrorMessage());
 
-        // ==========================================
-        // STAGE 5: TESTING AGENT (ISOLATED SANDBOX)
-        // ==========================================
-        updateProjectStatus(project, "TESTING", "TESTING_AGENT", 75);
-        AgentExecutionResult testResult = runAgentStep(project, testingAgent, context, "Executing automated test suites in isolated sandbox...");
+        broadcastWorkflow(project, "FRONTEND_DEVELOPER", "COMPLETED", 70, feOutput.getSummary());
 
-        if (testResult.getFiles() != null) {
-            saveGeneratedFiles(project, testResult.getFiles(), "TESTING_AGENT");
+        // Refresh latest files from DB into context
+        List<GeneratedFile> latestFiles = fileRepository.findByProjectIdAndIsLatestTrueOrderByFilePathAsc(project.getId());
+        context.setGeneratedFiles(latestFiles);
+
+        List<GeneratedSourceFile> sourceFiles = latestFiles.stream()
+                .map(f -> GeneratedSourceFile.builder()
+                        .filePath(f.getFilePath())
+                        .content(f.getFileContent())
+                        .language(f.getLanguage())
+                        .build())
+                .toList();
+
+        // =========================================================================
+        // AGENT 5: TESTING AGENT (SANDBOX TEST RUNNER)
+        // =========================================================================
+        if (checkIfPaused(projectId)) return;
+
+        updateProjectState(project, "TESTING", "TESTING_AGENT", 75);
+        broadcastWorkflow(project, "TESTING_AGENT", "RUNNING", 75, "Generating automated test suites and executing in isolated sandbox...");
+
+        TestingAgentInput testInput = TestingAgentInput.builder()
+                .projectId(project.getId())
+                .projectName(project.getProjectName())
+                .requirementSpec(context.getRequirementSpec())
+                .architectureSpec(context.getArchitectureSpec())
+                .sourceFiles(sourceFiles)
+                .build();
+
+        TestingAgentOutput testOutput = executeWithRetry("TESTING_AGENT", () -> testingAgent.runTests(testInput));
+
+        if (testOutput.isSuccess() && testOutput.getReport() != null) {
+            context.setTestReport(testOutput.getReport());
+            if (testOutput.getTestFiles() != null && !testOutput.getTestFiles().isEmpty()) {
+                saveGeneratedFiles(project, testOutput.getTestFiles(), "TESTING_AGENT");
+            }
+            persistTestResults(project, testOutput.getReport());
         }
-        persistTestResults(project, context.getTestReport());
 
-        // ==========================================
-        // STAGE 6: CODE REVIEWER & SELF-HEALING LOOP
-        // ==========================================
-        updateProjectStatus(project, "REVIEWING", "CODE_REVIEWER", 85);
-        AgentExecutionResult reviewResult = runAgentStep(project, codeReviewer, context, "Auditing code for security vulnerabilities, bugs, and performance...");
-        persistCodeReviews(project, context.getReviewReport());
+        persistExecutionHistory(project, "TESTING_AGENT", "Testing Agent", testInput, testOutput, testOutput.isSuccess(),
+                testOutput.getSummary(), testOutput.getExecutionDurationMs(), testOutput.getErrorMessage());
 
-        // Check for Self-Healing requirement
-        boolean needsHealing = context.getReviewReport() != null && !context.getReviewReport().isApproved();
-        if (needsHealing && project.getRetryCount() < MAX_SELF_HEALING_RETRIES) {
-            log.info("Self-healing triggered for project {}. Iteration {}/{}", project.getId(), project.getRetryCount() + 1, MAX_SELF_HEALING_RETRIES);
+        broadcastWorkflow(project, "TESTING_AGENT", "COMPLETED", 80, testOutput.getSummary());
 
-            project.setRetryCount(project.getRetryCount() + 1);
-            project.setStatus("SELF_HEALING");
-            projectRepository.save(project);
+        // =========================================================================
+        // AGENT 6: CODE REVIEWER & AUTONOMOUS SELF-HEALING LOOP
+        // =========================================================================
+        if (checkIfPaused(projectId)) return;
 
-            broadcastStatus(project, "CODE_REVIEWER", "RUNNING", 80,
-                    "Self-healing in progress: Attempting fix iteration " + project.getRetryCount() + "/" + MAX_SELF_HEALING_RETRIES);
+        updateProjectState(project, "REVIEWING", "CODE_REVIEWER", 85);
+        broadcastWorkflow(project, "CODE_REVIEWER", "RUNNING", 85, "Auditing code quality, OWASP security vulnerabilities, and architecture alignment...");
 
-            // Re-run developer with review feedback
-            context.setFeedbackMessage("Code review identified issues that must be addressed:\n" + context.getReviewReport().getSummary());
-            runAgentStep(project, backendDeveloper, context, "Applying self-healing fixes to backend code...");
-            runAgentStep(project, testingAgent, context, "Re-verifying fixes in test sandbox...");
-            runAgentStep(project, codeReviewer, context, "Final quality validation...");
+        CodeReviewerInput reviewInput = CodeReviewerInput.builder()
+                .projectId(project.getId())
+                .projectName(project.getProjectName())
+                .requirementSpec(context.getRequirementSpec())
+                .architectureSpec(context.getArchitectureSpec())
+                .sourceFiles(sourceFiles)
+                .testReport(context.getTestReport())
+                .build();
+
+        CodeReviewerOutput reviewOutput = executeWithRetry("CODE_REVIEWER", () -> codeReviewer.reviewCode(reviewInput));
+
+        if (reviewOutput.isSuccess() && reviewOutput.getReport() != null) {
+            context.setReviewReport(reviewOutput.getReport());
+            persistCodeReviews(project, reviewOutput.getReport());
         }
 
-        // ==========================================
-        // STAGE 7: DOCUMENTATION AGENT
-        // ==========================================
-        updateProjectStatus(project, "DOCUMENTING", "DOCUMENTATION_AGENT", 95);
-        AgentExecutionResult docResult = runAgentStep(project, documentationAgent, context, "Generating README, architecture docs, and API reference...");
+        persistExecutionHistory(project, "CODE_REVIEWER", "Code Reviewer", reviewInput, reviewOutput, reviewOutput.isSuccess(),
+                reviewOutput.getSummary(), reviewOutput.getExecutionDurationMs(), reviewOutput.getErrorMessage());
 
-        if (docResult.getFiles() != null) {
-            saveGeneratedFiles(project, docResult.getFiles(), "DOCUMENTATION_AGENT");
+        broadcastWorkflow(project, "CODE_REVIEWER", "COMPLETED", 90, reviewOutput.getSummary());
+
+        // Autonomous Self-Healing Retry Loop (Guarded against infinite cycles)
+        boolean hasTestFailures = context.getTestReport() != null && !context.getTestReport().isAllPassed();
+        boolean hasReviewRejection = context.getReviewReport() != null && !context.getReviewReport().isApproved();
+
+        int currentRetry = project.getRetryCount() != null ? project.getRetryCount() : 0;
+
+        while ((hasTestFailures || hasReviewRejection) && currentRetry < maxSelfHealingRetries) {
+            currentRetry++;
+            totalStepCounter++;
+
+            // Global infinite loop prevention circuit-breaker
+            if (totalStepCounter > MAX_GLOBAL_CIRCUIT_BREAKER_STEPS) {
+                log.warn("[AgentOrchestrator] Global circuit-breaker step limit ({}) exceeded. Halting self-healing loop.", MAX_GLOBAL_CIRCUIT_BREAKER_STEPS);
+                break;
+            }
+
+            log.info("[AgentOrchestrator] Triggering Self-Healing Loop iteration {}/{} for project {}",
+                    currentRetry, maxSelfHealingRetries, project.getId());
+
+            project.setRetryCount(currentRetry);
+            updateProjectState(project, "SELF_HEALING", "BACKEND_DEVELOPER", 82);
+
+            String diagnosticMessage = buildSelfHealingDiagnostic(context.getTestReport(), context.getReviewReport());
+            broadcastStatus(project, "BACKEND_DEVELOPER", "RUNNING", 82,
+                    String.format("Self-Healing Iteration %d/%d: Repairing compiler/test errors and code review issues...", currentRetry, maxSelfHealingRetries));
+
+            // Targeted developer repair dispatch
+            BackendDeveloperInput repairInput = BackendDeveloperInput.builder()
+                    .projectId(project.getId())
+                    .projectName(project.getProjectName())
+                    .requirementSpec(context.getRequirementSpec())
+                    .architectureSpec(context.getArchitectureSpec())
+                    .compilerErrorDetails(diagnosticMessage)
+                    .feedbackMessage("Please fix the reported errors and security recommendations.")
+                    .build();
+
+            BackendDeveloperOutput repairOutput = backendDeveloper.generateBackend(repairInput);
+            if (repairOutput.isSuccess() && repairOutput.getFiles() != null) {
+                saveGeneratedFiles(project, repairOutput.getFiles(), "BACKEND_DEVELOPER");
+            }
+
+            // Re-run testing sandbox
+            TestingAgentOutput reTestOutput = testingAgent.runTests(TestingAgentInput.builder()
+                    .projectId(project.getId())
+                    .projectName(project.getProjectName())
+                    .requirementSpec(context.getRequirementSpec())
+                    .architectureSpec(context.getArchitectureSpec())
+                    .sourceFiles(sourceFiles)
+                    .build());
+
+            if (reTestOutput.isSuccess() && reTestOutput.getReport() != null) {
+                context.setTestReport(reTestOutput.getReport());
+                persistTestResults(project, reTestOutput.getReport());
+            }
+
+            // Re-run code review
+            CodeReviewerOutput reReviewOutput = codeReviewer.reviewCode(CodeReviewerInput.builder()
+                    .projectId(project.getId())
+                    .projectName(project.getProjectName())
+                    .requirementSpec(context.getRequirementSpec())
+                    .architectureSpec(context.getArchitectureSpec())
+                    .sourceFiles(sourceFiles)
+                    .testReport(context.getTestReport())
+                    .build());
+
+            if (reReviewOutput.isSuccess() && reReviewOutput.getReport() != null) {
+                context.setReviewReport(reReviewOutput.getReport());
+                persistCodeReviews(project, reReviewOutput.getReport());
+            }
+
+            hasTestFailures = context.getTestReport() != null && !context.getTestReport().isAllPassed();
+            hasReviewRejection = context.getReviewReport() != null && !context.getReviewReport().isApproved();
         }
-        persistProjectDocuments(project, context.getDocumentationBundle());
 
-        // ==========================================
-        // COMPLETION
-        // ==========================================
+        // =========================================================================
+        // AGENT 7: DOCUMENTATION AGENT
+        // =========================================================================
+        if (checkIfPaused(projectId)) return;
+
+        updateProjectState(project, "GENERATING_DOCUMENTATION", "DOCUMENTATION_AGENT", 95);
+        broadcastWorkflow(project, "DOCUMENTATION_AGENT", "RUNNING", 95, "Synthesizing comprehensive README, architecture specifications, and API documentation...");
+
+        DocumentationAgentInput docInput = DocumentationAgentInput.builder()
+                .projectId(project.getId())
+                .projectName(project.getProjectName())
+                .requirementSpec(context.getRequirementSpec())
+                .architectureSpec(context.getArchitectureSpec())
+                .sourceFiles(sourceFiles)
+                .testReport(context.getTestReport())
+                .reviewReport(context.getReviewReport())
+                .build();
+
+        DocumentationAgentOutput docOutput = executeWithRetry("DOCUMENTATION_AGENT", () -> documentationAgent.generateDocumentation(docInput));
+
+        if (docOutput.isSuccess() && docOutput.getDocumentationBundle() != null) {
+            context.setDocumentationBundle(docOutput.getDocumentationBundle());
+            persistProjectDocuments(project, docOutput.getDocumentationBundle());
+        }
+
+        persistExecutionHistory(project, "DOCUMENTATION_AGENT", "Documentation Agent", docInput, docOutput, docOutput.isSuccess(),
+                docOutput.getSummary(), docOutput.getExecutionDurationMs(), docOutput.getErrorMessage());
+
+        broadcastWorkflow(project, "DOCUMENTATION_AGENT", "COMPLETED", 98, docOutput.getSummary());
+
+        // =========================================================================
+        // PIPELINE COMPLETION
+        // =========================================================================
         project.setStatus("COMPLETED");
         project.setProgressPercentage(100);
         project.setCurrentAgent("DOCUMENTATION_AGENT");
         projectRepository.save(project);
 
-        broadcastStatus(project, "DOCUMENTATION_AGENT", "COMPLETED", 100, "Project successfully generated and ready for download!");
-        log.info("Workflow successfully completed for project {}", project.getId());
+        broadcastStatus(project, "DOCUMENTATION_AGENT", "COMPLETED", 100, "All 7 AI Agents completed successfully! Full-stack project is ready for download.");
+        log.info("[AgentOrchestrator] Multi-agent software engineering workflow successfully completed for project {}!", project.getId());
     }
 
-    private AgentExecutionResult runAgentStep(Project project, BaseAgent agent, AgentContext context, String taskDescription) {
-        Agent agentEntity = agentRepository.findByAgentType(agent.getAgentType())
-                .orElseGet(() -> agentRepository.save(Agent.builder()
-                        .agentName(agent.getAgentName())
-                        .agentType(agent.getAgentType())
-                        .build()));
+    /**
+     * Executes an agent task with configurable retries and exponential backoff.
+     */
+    private <T> T executeWithRetry(String agentType, AgentSupplier<T> supplier) {
+        int attempts = 0;
+        Exception lastException = null;
 
-        AgentExecution execution = AgentExecution.builder()
-                .project(project)
-                .agent(agentEntity)
-                .executionStatus("RUNNING")
-                .currentTask(taskDescription)
-                .progressPercentage(10)
-                .startedAt(LocalDateTime.now())
-                .build();
-        execution = executionRepository.save(execution);
+        while (attempts < maxAgentRetries) {
+            attempts++;
+            try {
+                return supplier.get();
+            } catch (Exception e) {
+                lastException = e;
+                log.warn("[AgentOrchestrator] Agent {} failed attempt {}/{}: {}", agentType, attempts, maxAgentRetries, e.getMessage());
+                try {
+                    Thread.sleep(1000L * attempts);
+                } catch (InterruptedException ie) {
+                    Thread.currentThread().interrupt();
+                    throw new RuntimeException("Agent execution interrupted", ie);
+                }
+            }
+        }
 
-        broadcastExecution(project, agent, "RUNNING", 20, taskDescription);
+        log.error("[AgentOrchestrator] Agent {} exhausted all {} retry attempts.", agentType, maxAgentRetries);
+        throw new RuntimeException(String.format("Agent %s failed after %d attempts: %s", agentType, maxAgentRetries,
+                lastException != null ? lastException.getMessage() : "Unknown error"), lastException);
+    }
 
-        long start = System.currentTimeMillis();
-        AgentExecutionResult result = agent.execute(context);
-        long duration = System.currentTimeMillis() - start;
+    @FunctionalInterface
+    private interface AgentSupplier<T> {
+        T get() throws Exception;
+    }
 
-        execution.setExecutionStatus(result.isSuccess() ? "COMPLETED" : "FAILED");
-        execution.setProgressPercentage(result.isSuccess() ? 100 : 0);
-        execution.setOutputData(result.getOutputData());
-        execution.setErrorMessage(result.getErrorMessage());
-        execution.setDurationMs(duration);
-        execution.setCompletedAt(LocalDateTime.now());
-        executionRepository.save(execution);
+    private boolean checkIfPaused(Long projectId) {
+        if (pausedProjects.contains(projectId)) {
+            log.info("[AgentOrchestrator] Halting workflow for project {} because it was paused.", projectId);
+            return true;
+        }
+        return false;
+    }
 
-        broadcastExecution(project, agent, execution.getExecutionStatus(), 100, result.getSummary() != null ? result.getSummary() : taskDescription);
-        return result;
+    private String buildSelfHealingDiagnostic(TestExecutionReport testReport, CodeReviewReport reviewReport) {
+        StringBuilder diag = new StringBuilder();
+        if (testReport != null && testReport.getTestCases() != null) {
+            for (var tc : testReport.getTestCases()) {
+                if (!"PASSED".equalsIgnoreCase(tc.getStatus())) {
+                    diag.append("Test Failure: ").append(tc.getTestName()).append(" in ").append(tc.getTestClass()).append("\n");
+                    diag.append("Error Message: ").append(tc.getErrorMessage()).append("\n");
+                    if (tc.getStackTrace() != null) diag.append("Stack Trace: ").append(tc.getStackTrace()).append("\n");
+                }
+            }
+        }
+        if (reviewReport != null && reviewReport.getIssues() != null) {
+            for (var issue : reviewReport.getIssues()) {
+                if ("ERROR".equalsIgnoreCase(issue.getSeverity()) || "CRITICAL".equalsIgnoreCase(issue.getSeverity())) {
+                    diag.append("Review Issue in ").append(issue.getFilePath()).append(": ").append(issue.getIssueDescription()).append("\n");
+                    diag.append("Suggested Fix: ").append(issue.getSuggestedFix()).append("\n");
+                }
+            }
+        }
+        return diag.toString();
     }
 
     @Transactional
     public void saveGeneratedFiles(Project project, List<GeneratedSourceFile> files, String agentType) {
+        if (files == null || files.isEmpty()) return;
+
         for (GeneratedSourceFile file : files) {
-            // Check existing versions
             Integer maxVersion = fileRepository.findMaxVersion(project.getId(), file.getFilePath());
             int newVersion = (maxVersion != null) ? maxVersion + 1 : 1;
 
-            // Mark previous version as not latest
             fileRepository.findByProjectIdAndFilePathAndIsLatestTrue(project.getId(), file.getFilePath())
                     .ifPresent(existing -> {
                         existing.setIsLatest(false);
@@ -269,6 +531,40 @@ public class AgentOrchestrator {
                     .generatedByAgent(agentType)
                     .build();
             fileRepository.save(gf);
+        }
+    }
+
+    private void persistExecutionHistory(Project project, String agentType, String agentName, Object inputDto, Object outputDto,
+                                         boolean success, String summary, long durationMs, String errorMessage) {
+        try {
+            Agent agentEntity = agentRepository.findByAgentType(agentType)
+                    .orElseGet(() -> agentRepository.save(Agent.builder()
+                            .agentName(agentName)
+                            .agentType(agentType)
+                            .description(summary)
+                            .build()));
+
+            String inputJson = inputDto != null ? objectMapper.writeValueAsString(inputDto) : null;
+            String outputJson = outputDto != null ? objectMapper.writeValueAsString(outputDto) : null;
+
+            AgentExecution execution = AgentExecution.builder()
+                    .project(project)
+                    .agent(agentEntity)
+                    .executionStatus(success ? "COMPLETED" : "FAILED")
+                    .currentTask(summary)
+                    .inputData(inputJson)
+                    .outputData(outputJson)
+                    .progressPercentage(success ? 100 : 0)
+                    .durationMs(durationMs)
+                    .errorMessage(errorMessage)
+                    .startedAt(LocalDateTime.now().minusNanos(durationMs * 1_000_000))
+                    .completedAt(LocalDateTime.now())
+                    .build();
+
+            executionRepository.save(execution);
+
+        } catch (Exception e) {
+            log.error("[AgentOrchestrator] Error persisting agent execution history: {}", e.getMessage(), e);
         }
     }
 
@@ -322,7 +618,7 @@ public class AgentOrchestrator {
         documentRepository.save(doc);
     }
 
-    private void updateProjectStatus(Project project, String status, String currentAgent, int progress) {
+    private void updateProjectState(Project project, String status, String currentAgent, int progress) {
         project.setStatus(status);
         project.setCurrentAgent(currentAgent);
         project.setProgressPercentage(progress);
@@ -337,11 +633,10 @@ public class AgentOrchestrator {
         });
     }
 
-    private void broadcastExecution(Project project, BaseAgent agent, String status, int progress, String task) {
+    private void broadcastWorkflow(Project project, String agentType, String status, int progress, String task) {
         sseService.broadcastEvent(project.getId(), "AGENT_STATUS", OrchestrationEvent.builder()
                 .projectId(project.getId())
-                .agentType(agent.getAgentType())
-                .agentName(agent.getAgentName())
+                .agentType(agentType)
                 .status(status)
                 .progressPercentage(progress)
                 .currentTask(task)
@@ -369,16 +664,21 @@ public class AgentOrchestrator {
                 .generatedFiles(fileRepository.findByProjectIdAndIsLatestTrueOrderByFilePathAsc(project.getId()))
                 .build();
 
-        // Check if requirement execution exists
         executionRepository.findByProjectIdOrderByStartedAtAsc(project.getId()).forEach(exec -> {
             if ("REQUIREMENT_ANALYST".equals(exec.getAgent().getAgentType()) && exec.getOutputData() != null) {
                 try {
-                    context.setRequirementSpec(objectMapper.readValue(exec.getOutputData(), RequirementSpec.class));
+                    RequirementAnalysisOutput out = objectMapper.readValue(exec.getOutputData(), RequirementAnalysisOutput.class);
+                    if (out != null && out.getRequirementSpec() != null) {
+                        context.setRequirementSpec(out.getRequirementSpec());
+                    }
                 } catch (Exception ignored) {}
             }
             if ("SYSTEM_ARCHITECT".equals(exec.getAgent().getAgentType()) && exec.getOutputData() != null) {
                 try {
-                    context.setArchitectureSpec(objectMapper.readValue(exec.getOutputData(), SystemArchitectureSpec.class));
+                    SystemArchitectOutput out = objectMapper.readValue(exec.getOutputData(), SystemArchitectOutput.class);
+                    if (out != null && out.getArchitectureSpec() != null) {
+                        context.setArchitectureSpec(out.getArchitectureSpec());
+                    }
                 } catch (Exception ignored) {}
             }
         });
