@@ -49,6 +49,7 @@ public class AgentOrchestrator {
     private final TestingAgent testingAgent;
     private final CodeReviewerAgent codeReviewer;
     private final DocumentationAgent documentationAgent;
+    private final DiagnosticAnalyzer diagnosticAnalyzer;
 
     private final SseNotificationService sseService;
     private final ObjectMapper objectMapper;
@@ -333,6 +334,7 @@ public class AgentOrchestrator {
         boolean hasReviewRejection = context.getReviewReport() != null && !context.getReviewReport().isApproved();
 
         int currentRetry = project.getRetryCount() != null ? project.getRetryCount() : 0;
+        com.agentforge.sandbox.SandboxResult lastSandboxResult = testOutput.getSandboxResult();
 
         while ((hasTestFailures || hasReviewRejection) && currentRetry < maxSelfHealingRetries) {
             currentRetry++;
@@ -348,28 +350,76 @@ public class AgentOrchestrator {
                     currentRetry, maxSelfHealingRetries, project.getId());
 
             project.setRetryCount(currentRetry);
-            updateProjectState(project, "SELF_HEALING", "BACKEND_DEVELOPER", 82);
 
-            String diagnosticMessage = buildSelfHealingDiagnostic(context.getTestReport(), context.getReviewReport());
-            broadcastStatus(project, "BACKEND_DEVELOPER", "RUNNING", 82,
-                    String.format("Self-Healing Iteration %d/%d: Repairing compiler/test errors and code review issues...", currentRetry, maxSelfHealingRetries));
+            // 1 & 2: Capture error logs and identify the responsible files and agent
+            FailureDiagnostic diagnostic = diagnosticAnalyzer.analyzeFailure(
+                    lastSandboxResult, context.getTestReport(), context.getReviewReport(), sourceFiles
+            );
 
-            // Targeted developer repair dispatch
-            BackendDeveloperInput repairInput = BackendDeveloperInput.builder()
-                    .projectId(project.getId())
-                    .projectName(project.getProjectName())
-                    .requirementSpec(context.getRequirementSpec())
-                    .architectureSpec(context.getArchitectureSpec())
-                    .compilerErrorDetails(diagnosticMessage)
-                    .feedbackMessage("Please fix the reported errors and security recommendations.")
-                    .build();
+            String responsibleAgent = diagnostic.getResponsibleAgentType();
+            String targetFile = diagnostic.getResponsibleFilePath();
+            int lineNumber = diagnostic.getLineNumber();
+            String errorSummary = diagnostic.getErrorSummary();
 
-            BackendDeveloperOutput repairOutput = backendDeveloper.generateBackend(repairInput);
-            if (repairOutput.isSuccess() && repairOutput.getFiles() != null) {
-                saveGeneratedFiles(project, repairOutput.getFiles(), "BACKEND_DEVELOPER");
+            log.info("[AgentOrchestrator] Self-healing diagnostic: Responsible Agent={}, File={}, Line={}, Error='{}'",
+                    responsibleAgent, targetFile, lineNumber, errorSummary);
+
+            updateProjectState(project, "SELF_HEALING", responsibleAgent, 82);
+            broadcastStatus(project, responsibleAgent, "RUNNING", 82,
+                    String.format("Self-Healing Iteration %d/%d: %s repairing %s (Line %d)...",
+                            currentRetry, maxSelfHealingRetries, responsibleAgent,
+                            targetFile != null ? targetFile : "source files", lineNumber));
+
+            // 3 & 4: Send errors to appropriate developer agent and generate code corrections
+            if ("FRONTEND_DEVELOPER".equalsIgnoreCase(responsibleAgent)) {
+                FrontendDeveloperInput repairInput = FrontendDeveloperInput.builder()
+                        .projectId(project.getId())
+                        .projectName(project.getProjectName())
+                        .requirementSpec(context.getRequirementSpec())
+                        .architectureSpec(context.getArchitectureSpec())
+                        .targetFilePath(targetFile)
+                        .feedbackMessage(String.format("Self-healing repair for %s: %s\nFull error logs:\n%s",
+                                targetFile, errorSummary, diagnostic.getFullErrorLogs()))
+                        .build();
+
+                FrontendDeveloperOutput feRepairOutput = frontendDeveloper.generateFrontend(repairInput);
+                if (feRepairOutput.isSuccess() && feRepairOutput.getFiles() != null) {
+                    saveGeneratedFiles(project, feRepairOutput.getFiles(), "FRONTEND_DEVELOPER");
+                }
+            } else {
+                BackendDeveloperInput repairInput = BackendDeveloperInput.builder()
+                        .projectId(project.getId())
+                        .projectName(project.getProjectName())
+                        .requirementSpec(context.getRequirementSpec())
+                        .architectureSpec(context.getArchitectureSpec())
+                        .targetFilePath(targetFile)
+                        .compilerErrorDetails(String.format("Diagnostic for %s at line %d: %s\n\nFull logs:\n%s",
+                                targetFile, lineNumber, errorSummary, diagnostic.getFullErrorLogs()))
+                        .feedbackMessage("Fix compiler/test errors and maintain architectural integrity.")
+                        .build();
+
+                BackendDeveloperOutput beRepairOutput = backendDeveloper.generateBackend(repairInput);
+                if (beRepairOutput.isSuccess() && beRepairOutput.getFiles() != null) {
+                    saveGeneratedFiles(project, beRepairOutput.getFiles(), "BACKEND_DEVELOPER");
+                }
             }
 
-            // Re-run testing sandbox
+            // 7. Save every code version: refresh context with latest files from repository
+            latestFiles = fileRepository.findByProjectIdAndIsLatestTrueOrderByFilePathAsc(project.getId());
+            context.setGeneratedFiles(latestFiles);
+            sourceFiles = latestFiles.stream()
+                    .map(f -> GeneratedSourceFile.builder()
+                            .filePath(f.getFilePath())
+                            .content(f.getFileContent())
+                            .language(f.getLanguage())
+                            .build())
+                    .toList();
+
+            // 5: Execute tests again inside isolated sandbox
+            updateProjectState(project, "TESTING", "TESTING_AGENT", 84);
+            broadcastWorkflow(project, "TESTING_AGENT", "RUNNING", 84,
+                    String.format("Re-testing corrected code in isolated sandbox (Iteration %d/%d)...", currentRetry, maxSelfHealingRetries));
+
             TestingAgentOutput reTestOutput = testingAgent.runTests(TestingAgentInput.builder()
                     .projectId(project.getId())
                     .projectName(project.getProjectName())
@@ -380,10 +430,15 @@ public class AgentOrchestrator {
 
             if (reTestOutput.isSuccess() && reTestOutput.getReport() != null) {
                 context.setTestReport(reTestOutput.getReport());
+                lastSandboxResult = reTestOutput.getSandboxResult();
                 persistTestResults(project, reTestOutput.getReport());
             }
 
-            // Re-run code review
+            // 6: Send updated code to Code Reviewer
+            updateProjectState(project, "REVIEWING", "CODE_REVIEWER", 88);
+            broadcastWorkflow(project, "CODE_REVIEWER", "RUNNING", 88,
+                    String.format("Re-auditing corrected code quality and security (Iteration %d/%d)...", currentRetry, maxSelfHealingRetries));
+
             CodeReviewerOutput reReviewOutput = codeReviewer.reviewCode(CodeReviewerInput.builder()
                     .projectId(project.getId())
                     .projectName(project.getProjectName())

@@ -4,6 +4,7 @@ import com.agentforge.ai.agent.*;
 import com.agentforge.ai.client.AiClientService;
 import com.agentforge.ai.client.MockAiProvider;
 import com.agentforge.ai.orchestrator.AgentOrchestrator;
+import com.agentforge.ai.orchestrator.DiagnosticAnalyzer;
 import com.agentforge.ai.springai.ChatClient;
 import com.agentforge.ai.springai.SpringAiChatModel;
 import com.agentforge.entity.*;
@@ -170,6 +171,7 @@ public class AgentOrchestratorTest {
                 testingAgent,
                 codeReviewer,
                 documentationAgent,
+                new DiagnosticAnalyzer(),
                 sseService,
                 objectMapper
         );

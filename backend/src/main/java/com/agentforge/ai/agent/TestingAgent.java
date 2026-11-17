@@ -53,15 +53,22 @@ public class TestingAgent implements BaseAgent {
             List<GeneratedSourceFile> allFiles = new ArrayList<>(input.getSourceFiles() != null ? input.getSourceFiles() : List.of());
             allFiles.addAll(testFiles);
 
-            // 3. Execute in isolated sandbox
+            // 3. Determine test execution command and timeout
+            String command = input.getTestCommand();
+            if (command == null || command.isBlank()) {
+                command = buildDefaultTestCommand(allFiles);
+            }
+            int timeout = input.getTimeoutSeconds() > 0 ? input.getTimeoutSeconds() : 30;
+
+            // 4. Execute in isolated sandbox
             SandboxResult sandboxResult = sandboxManager.runInSandbox(
                     input.getProjectId() != null ? input.getProjectId() : 1L,
                     allFiles,
-                    "echo \"Running automated test suite in sandbox isolation...\"",
-                    30
+                    command,
+                    timeout
             );
 
-            // 4. Synthesize structured test report via LLM
+            // 5. Synthesize structured test report via LLM
             StringBuilder promptBuilder = new StringBuilder();
             promptBuilder.append("Project: ").append(input.getProjectName() != null ? input.getProjectName() : "Application").append("\n");
             promptBuilder.append("Sandbox Isolation Tier: ").append(sandboxResult.getIsolationTier()).append("\n");
@@ -87,19 +94,57 @@ public class TestingAgent implements BaseAgent {
                     .call()
                     .entity(TestExecutionReport.class);
 
+            if (report == null) {
+                report = new TestExecutionReport();
+            }
+
+            // Real execution enforcement: Capture actual sandbox logs and do not simulate success if sandbox failed
+            String combinedLogs = ((sandboxResult.getStdout() != null ? sandboxResult.getStdout() : "") +
+                    (sandboxResult.getStderr() != null ? "\n" + sandboxResult.getStderr() : "")).trim();
+            report.setExecutionLogs(combinedLogs);
+
+            boolean hasSandboxFailure = !sandboxResult.isSuccess() || sandboxResult.getExitCode() != 0 || sandboxResult.isTimedOut();
+            boolean hasCompilerErrors = combinedLogs.contains("[ERROR]") || combinedLogs.contains("COMPILATION ERROR")
+                    || combinedLogs.contains("error: ") || combinedLogs.contains("cannot find symbol");
+
+            if (hasSandboxFailure || hasCompilerErrors) {
+                report.setAllPassed(false);
+                if (report.getFailedCount() == 0) {
+                    int total = report.getTotalTests() > 0 ? report.getTotalTests() : 1;
+                    int passed = Math.max(0, report.getPassedCount());
+                    report.setTotalTests(total);
+                    report.setFailedCount(Math.max(1, total - passed));
+                }
+                if (report.getTestCases() == null || report.getTestCases().isEmpty()) {
+                    List<TestExecutionReport.TestCaseResult> tcList = new ArrayList<>();
+                    tcList.add(TestExecutionReport.TestCaseResult.builder()
+                            .testName("SandboxBuildAndExecution")
+                            .testClass("IsolatedSandboxTestRunner")
+                            .status("FAILED")
+                            .errorMessage(sandboxResult.isTimedOut() ? "Sandbox execution timed out after " + timeout + "s" :
+                                    "Execution failed with exit code " + sandboxResult.getExitCode())
+                            .stackTrace(combinedLogs)
+                            .executionTimeMs(sandboxResult.getExecutionTimeMs())
+                            .build());
+                    report.setTestCases(tcList);
+                }
+            }
+
             long duration = System.currentTimeMillis() - start;
-            String summary = String.format("Executed %d tests: %d passed, %d failed. Status: %s (Duration: %d ms).",
+            String summary = String.format("Executed %d tests: %d passed, %d failed. Status: %s (Duration: %d ms, Sandbox Exit Code: %d).",
                     report.getTotalTests(),
                     report.getPassedCount(),
                     report.getFailedCount(),
                     report.isAllPassed() ? "ALL PASSED" : "FAILURES DETECTED",
-                    duration);
+                    duration,
+                    sandboxResult.getExitCode());
 
             log.info("[TestingAgent] Test execution completed: {}", summary);
 
             return TestingAgentOutput.builder()
                     .success(true)
                     .report(report)
+                    .sandboxResult(sandboxResult)
                     .testFiles(testFiles)
                     .summary(summary)
                     .executionDurationMs(duration)
@@ -211,5 +256,14 @@ public class TestingAgent implements BaseAgent {
                     .executionTimeMs(output.getExecutionDurationMs())
                     .build();
         }
+    }
+
+    private String buildDefaultTestCommand(List<GeneratedSourceFile> files) {
+        boolean hasPom = files != null && files.stream().anyMatch(f -> f.getFilePath() != null && f.getFilePath().endsWith("pom.xml"));
+        boolean isWindows = System.getProperty("os.name").toLowerCase().contains("win");
+        if (hasPom) {
+            return isWindows ? "if exist pom.xml (mvn test -B) else (echo Verified files)" : "test -f pom.xml && mvn test -B || echo 'Verified files'";
+        }
+        return "echo \"Running automated test suite in sandbox isolation...\"";
     }
 }

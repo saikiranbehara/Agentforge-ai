@@ -22,4 +22,7 @@ public class TestingAgentInput {
     private SystemArchitectureSpec architectureSpec;
     @Builder.Default
     private List<GeneratedSourceFile> sourceFiles = new ArrayList<>();
+    private String testCommand;
+    @Builder.Default
+    private int timeoutSeconds = 30;
 }

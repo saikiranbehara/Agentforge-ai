@@ -2,6 +2,7 @@ package com.agentforge.ai.agent.dto;
 
 import com.agentforge.ai.model.GeneratedSourceFile;
 import com.agentforge.ai.model.TestExecutionReport;
+import com.agentforge.sandbox.SandboxResult;
 import lombok.AllArgsConstructor;
 import lombok.Builder;
 import lombok.Data;
@@ -17,6 +18,7 @@ import java.util.List;
 public class TestingAgentOutput {
     private boolean success;
     private TestExecutionReport report;
+    private SandboxResult sandboxResult;
     @Builder.Default
     private List<GeneratedSourceFile> testFiles = new ArrayList<>();
     private String summary;
