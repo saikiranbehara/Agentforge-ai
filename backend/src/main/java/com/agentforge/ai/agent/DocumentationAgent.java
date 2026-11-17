@@ -1,9 +1,11 @@
 package com.agentforge.ai.agent;
 
-import com.agentforge.ai.client.AiClientService;
+import com.agentforge.ai.agent.dto.DocumentationAgentInput;
+import com.agentforge.ai.agent.dto.DocumentationAgentOutput;
 import com.agentforge.ai.model.DocumentationBundle;
 import com.agentforge.ai.model.GeneratedSourceFile;
 import com.agentforge.ai.prompt.PromptTemplates;
+import com.agentforge.ai.springai.ChatClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
@@ -17,7 +19,7 @@ import java.util.List;
 @RequiredArgsConstructor
 public class DocumentationAgent implements BaseAgent {
 
-    private final AiClientService aiClient;
+    private final ChatClient chatClient;
     private final ObjectMapper objectMapper;
 
     @Override
@@ -30,61 +32,127 @@ public class DocumentationAgent implements BaseAgent {
         return "Documentation Agent";
     }
 
-    @Override
-    public AgentExecutionResult execute(AgentContext context) {
+    /**
+     * Strongly-typed independent execution entry point for Agent 7.
+     */
+    public DocumentationAgentOutput generateDocumentation(DocumentationAgentInput input) {
         long start = System.currentTimeMillis();
+        log.info("[DocumentationAgent] Generating comprehensive documentation bundle for project: {} ({})",
+                input.getProjectId(), input.getProjectName());
+
         try {
-            log.info("Executing DocumentationAgent for project: {}", context.getProjectId());
+            StringBuilder promptBuilder = new StringBuilder();
+            promptBuilder.append("Project: ").append(input.getProjectName() != null ? input.getProjectName() : "Application").append("\n\n");
 
-            String prompt = "Synthesize comprehensive system documentation for this software project:\n"
-                    + context.getUserPrompt();
+            if (input.getRequirementSpec() != null) {
+                promptBuilder.append("Requirements Summary: ").append(input.getRequirementSpec().getSummary()).append("\n\n");
+            }
 
-            DocumentationBundle docs = aiClient.generateStructuredJson(
-                    PromptTemplates.DOCUMENTATION_AGENT_SYSTEM,
-                    prompt,
-                    DocumentationBundle.class
-            );
+            if (input.getArchitectureSpec() != null) {
+                promptBuilder.append("Architecture Pattern: ").append(input.getArchitectureSpec().getArchitecturePattern()).append("\n");
+                if (input.getArchitectureSpec().getApiEndpoints() != null) {
+                    promptBuilder.append("API Endpoints Count: ").append(input.getArchitectureSpec().getApiEndpoints().size()).append("\n");
+                }
+                if (input.getArchitectureSpec().getDatabaseSchema() != null) {
+                    promptBuilder.append("Database Tables Count: ").append(input.getArchitectureSpec().getDatabaseSchema().size()).append("\n");
+                }
+                promptBuilder.append("\n");
+            }
 
-            context.setDocumentationBundle(docs);
-            String jsonOutput = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(docs);
+            if (input.getSourceFiles() != null && !input.getSourceFiles().isEmpty()) {
+                promptBuilder.append("Key Files Generated: ").append(input.getSourceFiles().size()).append(" source files.\n\n");
+            }
 
-            // Add markdown files to generated files list
-            List<GeneratedSourceFile> docFiles = new ArrayList<>();
-            docFiles.add(GeneratedSourceFile.builder()
-                    .filePath("README.md")
-                    .language("markdown")
-                    .description("Project Master README")
-                    .content(docs.getReadme())
-                    .build());
-            docFiles.add(GeneratedSourceFile.builder()
-                    .filePath("docs/ARCHITECTURE.md")
-                    .language("markdown")
-                    .description("Detailed Architecture Guide")
-                    .content(docs.getArchitectureDoc())
-                    .build());
-            docFiles.add(GeneratedSourceFile.builder()
-                    .filePath("docs/API_REFERENCE.md")
-                    .language("markdown")
-                    .description("Complete REST API Reference")
-                    .content(docs.getApiDocs())
-                    .build());
+            promptBuilder.append("Synthesize a complete documentation suite formatted as DocumentationBundle JSON:\n");
+            promptBuilder.append("1. readme: Full Markdown README with badges, overview, stack, run steps, and curl examples.\n");
+            promptBuilder.append("2. architectureDoc: System architecture, layers, and data flow.\n");
+            promptBuilder.append("3. installationGuide: Prerequisites and step-by-step installation instructions.\n");
+            promptBuilder.append("4. apiDocs: Comprehensive REST API endpoint reference.\n");
+            promptBuilder.append("5. deploymentGuide: Docker containerization and cloud deployment instructions.");
+
+            log.debug("[DocumentationAgent] Dispatching documentation synthesis prompt to LLM via Spring AI ChatClient");
+
+            DocumentationBundle bundle = chatClient.prompt()
+                    .system(PromptTemplates.DOCUMENTATION_AGENT_SYSTEM)
+                    .user(promptBuilder.toString())
+                    .call()
+                    .entity(DocumentationBundle.class);
 
             long duration = System.currentTimeMillis() - start;
-            return AgentExecutionResult.builder()
+            String summary = String.format("Synthesized documentation bundle (README: %d chars, Architecture: %d chars, API: %d chars, Deployment: %d chars) in %d ms.",
+                    bundle.getReadme() != null ? bundle.getReadme().length() : 0,
+                    bundle.getArchitectureDoc() != null ? bundle.getArchitectureDoc().length() : 0,
+                    bundle.getApiDocs() != null ? bundle.getApiDocs().length() : 0,
+                    bundle.getDeploymentGuide() != null ? bundle.getDeploymentGuide().length() : 0,
+                    duration);
+
+            log.info("[DocumentationAgent] Documentation generation completed: {}", summary);
+
+            return DocumentationAgentOutput.builder()
                     .success(true)
-                    .outputData(jsonOutput)
-                    .summary("Generated complete documentation suite: README.md, Architecture Specs, Installation manual, and API Reference.")
-                    .files(docFiles)
-                    .executionTimeMs(duration)
+                    .documentationBundle(bundle)
+                    .summary(summary)
+                    .executionDurationMs(duration)
                     .build();
 
         } catch (Exception e) {
-            log.error("DocumentationAgent failed", e);
             long duration = System.currentTimeMillis() - start;
+            log.error("[DocumentationAgent] Error during documentation synthesis: {}", e.getMessage(), e);
+            return DocumentationAgentOutput.builder()
+                    .success(false)
+                    .errorMessage("Documentation synthesis failed: " + e.getMessage())
+                    .executionDurationMs(duration)
+                    .build();
+        }
+    }
+
+    @Override
+    public AgentExecutionResult execute(AgentContext context) {
+        List<GeneratedSourceFile> sources = new ArrayList<>();
+        if (context.getGeneratedFiles() != null) {
+            for (var f : context.getGeneratedFiles()) {
+                sources.add(GeneratedSourceFile.builder()
+                        .filePath(f.getFilePath())
+                        .content(f.getFileContent())
+                        .language(f.getLanguage())
+                        .build());
+            }
+        }
+
+        DocumentationAgentInput input = DocumentationAgentInput.builder()
+                .projectId(context.getProjectId())
+                .projectName(context.getProject() != null ? context.getProject().getProjectName() : null)
+                .requirementSpec(context.getRequirementSpec())
+                .architectureSpec(context.getArchitectureSpec())
+                .sourceFiles(sources)
+                .testReport(context.getTestReport())
+                .reviewReport(context.getReviewReport())
+                .build();
+
+        DocumentationAgentOutput output = generateDocumentation(input);
+
+        if (output.isSuccess()) {
+            context.setDocumentationBundle(output.getDocumentationBundle());
+            try {
+                String rawJson = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(output.getDocumentationBundle());
+                return AgentExecutionResult.builder()
+                        .success(true)
+                        .outputData(rawJson)
+                        .summary(output.getSummary())
+                        .executionTimeMs(output.getExecutionDurationMs())
+                        .build();
+            } catch (Exception e) {
+                return AgentExecutionResult.builder()
+                        .success(true)
+                        .summary(output.getSummary())
+                        .executionTimeMs(output.getExecutionDurationMs())
+                        .build();
+            }
+        } else {
             return AgentExecutionResult.builder()
                     .success(false)
-                    .errorMessage(e.getMessage())
-                    .executionTimeMs(duration)
+                    .errorMessage(output.getErrorMessage())
+                    .executionTimeMs(output.getExecutionDurationMs())
                     .build();
         }
     }

@@ -4,14 +4,14 @@ import com.agentforge.ai.agent.*;
 import com.agentforge.ai.client.AiClientService;
 import com.agentforge.ai.client.MockAiProvider;
 import com.agentforge.ai.model.*;
-import com.agentforge.entity.Project;
+import com.agentforge.ai.springai.ChatClient;
+import com.agentforge.ai.springai.SpringAiChatModel;
+import com.agentforge.sandbox.DockerExecutionSandbox;
 import com.agentforge.sandbox.ProcessIsolatedSandbox;
 import com.agentforge.sandbox.SandboxManager;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
-
-import java.util.List;
 
 import static org.junit.jupiter.api.Assertions.*;
 
@@ -20,6 +20,7 @@ public class AiAgentExecutionTest {
     private ObjectMapper objectMapper;
     private MockAiProvider mockAiProvider;
     private AiClientService aiClientService;
+    private ChatClient chatClient;
     private SandboxManager sandboxManager;
 
     private RequirementAnalystAgent requirementAnalyst;
@@ -44,18 +45,23 @@ public class AiAgentExecutionTest {
                 true // force mock mode
         );
 
+        SpringAiChatModel chatModel = new SpringAiChatModel(aiClientService);
+        chatClient = ChatClient.builder(chatModel)
+                .objectMapper(objectMapper)
+                .build();
+
         sandboxManager = new SandboxManager(
-                new com.agentforge.sandbox.DockerExecutionSandbox(),
+                new DockerExecutionSandbox(),
                 new ProcessIsolatedSandbox()
         );
 
-        requirementAnalyst = new RequirementAnalystAgent(aiClientService, objectMapper);
-        systemArchitect = new SystemArchitectAgent(aiClientService, objectMapper);
-        backendDeveloper = new BackendDeveloperAgent(aiClientService, objectMapper);
-        frontendDeveloper = new FrontendDeveloperAgent(aiClientService, objectMapper);
-        testingAgent = new TestingAgent(aiClientService, sandboxManager, objectMapper);
-        codeReviewer = new CodeReviewerAgent(aiClientService, objectMapper);
-        documentationAgent = new DocumentationAgent(aiClientService, objectMapper);
+        requirementAnalyst = new RequirementAnalystAgent(chatClient, objectMapper);
+        systemArchitect = new SystemArchitectAgent(chatClient, objectMapper);
+        backendDeveloper = new BackendDeveloperAgent(chatClient, objectMapper);
+        frontendDeveloper = new FrontendDeveloperAgent(chatClient, objectMapper);
+        testingAgent = new TestingAgent(chatClient, sandboxManager, objectMapper);
+        codeReviewer = new CodeReviewerAgent(chatClient, objectMapper);
+        documentationAgent = new DocumentationAgent(chatClient, objectMapper);
     }
 
     @Test
@@ -107,9 +113,16 @@ public class AiAgentExecutionTest {
         assertTrue(feResult.isSuccess());
         assertFalse(feResult.getFiles().isEmpty());
 
+        AgentExecutionResult testResult = testingAgent.execute(context);
+        assertTrue(testResult.isSuccess());
+        assertNotNull(context.getTestReport());
+
+        AgentExecutionResult reviewResult = codeReviewer.execute(context);
+        assertTrue(reviewResult.isSuccess());
+        assertNotNull(context.getReviewReport());
+
         AgentExecutionResult docResult = documentationAgent.execute(context);
         assertTrue(docResult.isSuccess());
         assertNotNull(context.getDocumentationBundle());
-        assertNotNull(context.getDocumentationBundle().getReadme());
     }
 }

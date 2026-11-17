@@ -1,19 +1,25 @@
 package com.agentforge.ai.agent;
 
-import com.agentforge.ai.client.AiClientService;
+import com.agentforge.ai.agent.dto.CodeReviewerInput;
+import com.agentforge.ai.agent.dto.CodeReviewerOutput;
 import com.agentforge.ai.model.CodeReviewReport;
+import com.agentforge.ai.model.GeneratedSourceFile;
 import com.agentforge.ai.prompt.PromptTemplates;
+import com.agentforge.ai.springai.ChatClient;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.List;
 
 @Slf4j
 @Component
 @RequiredArgsConstructor
 public class CodeReviewerAgent implements BaseAgent {
 
-    private final AiClientService aiClient;
+    private final ChatClient chatClient;
     private final ObjectMapper objectMapper;
 
     @Override
@@ -26,54 +32,122 @@ public class CodeReviewerAgent implements BaseAgent {
         return "Code Reviewer";
     }
 
-    @Override
-    public AgentExecutionResult execute(AgentContext context) {
+    /**
+     * Strongly-typed independent execution entry point for Agent 6.
+     */
+    public CodeReviewerOutput reviewCode(CodeReviewerInput input) {
         long start = System.currentTimeMillis();
-        try {
-            log.info("Executing CodeReviewerAgent for project: {}", context.getProjectId());
+        log.info("[CodeReviewerAgent] Starting automated code quality & security review for project: {} ({})",
+                input.getProjectId(), input.getProjectName());
 
-            StringBuilder codeSummary = new StringBuilder();
-            if (context.getGeneratedFiles() != null) {
-                for (var f : context.getGeneratedFiles()) {
-                    codeSummary.append("File: ").append(f.getFilePath()).append("\n");
-                    String content = f.getFileContent();
-                    if (content.length() > 500) {
-                        codeSummary.append(content, 0, 500).append("\n...[truncated]...\n");
-                    } else {
-                        codeSummary.append(content).append("\n");
-                    }
-                    codeSummary.append("----------------------------\n");
+        try {
+            StringBuilder promptBuilder = new StringBuilder();
+            promptBuilder.append("Project: ").append(input.getProjectName() != null ? input.getProjectName() : "Application").append("\n\n");
+
+            if (input.getSourceFiles() != null && !input.getSourceFiles().isEmpty()) {
+                promptBuilder.append("Generated Codebase Files (").append(input.getSourceFiles().size()).append(" total):\n");
+                for (GeneratedSourceFile file : input.getSourceFiles()) {
+                    promptBuilder.append("--- File: ").append(file.getFilePath()).append(" ---\n");
+                    // Truncate file content to avoid extreme context blowup while providing sufficient lines for review
+                    String content = file.getContent() != null ? file.getContent() : "";
+                    promptBuilder.append(content.length() > 600 ? content.substring(0, 600) + "\n...[truncated]..." : content).append("\n\n");
                 }
             }
 
-            String prompt = "Review the following generated source code for security flaws, bugs, and performance bottlenecks:\n"
-                    + codeSummary.toString();
+            if (input.getTestReport() != null) {
+                promptBuilder.append("Test Suite Execution Outcome:\n");
+                promptBuilder.append("- Total Tests: ").append(input.getTestReport().getTotalTests()).append("\n");
+                promptBuilder.append("- Passed: ").append(input.getTestReport().getPassedCount()).append("\n");
+                promptBuilder.append("- Failed: ").append(input.getTestReport().getFailedCount()).append("\n\n");
+            }
 
-            CodeReviewReport report = aiClient.generateStructuredJson(
-                    PromptTemplates.CODE_REVIEWER_SYSTEM,
-                    prompt,
-                    CodeReviewReport.class
-            );
+            promptBuilder.append("Conduct a comprehensive static analysis and security audit.\n");
+            promptBuilder.append("Check OWASP vulnerabilities, clean code practices, and efficiency.\n");
+            promptBuilder.append("Generate a CodeReviewReport JSON with qualityScore (0-100), approved (boolean), summary, issues list, and suggestions.");
 
-            context.setReviewReport(report);
-            String jsonOutput = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(report);
+            log.debug("[CodeReviewerAgent] Dispatching code review request to LLM via Spring AI ChatClient");
+
+            CodeReviewReport report = chatClient.prompt()
+                    .system(PromptTemplates.CODE_REVIEWER_SYSTEM)
+                    .user(promptBuilder.toString())
+                    .call()
+                    .entity(CodeReviewReport.class);
 
             long duration = System.currentTimeMillis() - start;
-            int issueCount = (report.getIssues() != null) ? report.getIssues().size() : 0;
-            return AgentExecutionResult.builder()
+            int issueCount = report.getIssues() != null ? report.getIssues().size() : 0;
+            String summary = String.format("Code Quality Score: %d/100. Status: %s. Identified %d issues and %d suggestions in %d ms.",
+                    report.getQualityScore(),
+                    report.isApproved() ? "APPROVED" : "REJECTED",
+                    issueCount,
+                    report.getSuggestions() != null ? report.getSuggestions().size() : 0,
+                    duration);
+
+            log.info("[CodeReviewerAgent] Code review completed: {}", summary);
+
+            return CodeReviewerOutput.builder()
                     .success(true)
-                    .outputData(jsonOutput)
-                    .summary("Code quality score: " + report.getQualityScore() + "/100. Status: " + (report.isApproved() ? "APPROVED" : "CHANGES REQUESTED") + " (" + issueCount + " items noted).")
-                    .executionTimeMs(duration)
+                    .report(report)
+                    .summary(summary)
+                    .executionDurationMs(duration)
                     .build();
 
         } catch (Exception e) {
-            log.error("CodeReviewerAgent failed", e);
             long duration = System.currentTimeMillis() - start;
+            log.error("[CodeReviewerAgent] Error during code review: {}", e.getMessage(), e);
+            return CodeReviewerOutput.builder()
+                    .success(false)
+                    .errorMessage("Code review failed: " + e.getMessage())
+                    .executionDurationMs(duration)
+                    .build();
+        }
+    }
+
+    @Override
+    public AgentExecutionResult execute(AgentContext context) {
+        List<GeneratedSourceFile> sources = new ArrayList<>();
+        if (context.getGeneratedFiles() != null) {
+            for (var f : context.getGeneratedFiles()) {
+                sources.add(GeneratedSourceFile.builder()
+                        .filePath(f.getFilePath())
+                        .content(f.getFileContent())
+                        .language(f.getLanguage())
+                        .build());
+            }
+        }
+
+        CodeReviewerInput input = CodeReviewerInput.builder()
+                .projectId(context.getProjectId())
+                .projectName(context.getProject() != null ? context.getProject().getProjectName() : null)
+                .requirementSpec(context.getRequirementSpec())
+                .architectureSpec(context.getArchitectureSpec())
+                .sourceFiles(sources)
+                .testReport(context.getTestReport())
+                .build();
+
+        CodeReviewerOutput output = reviewCode(input);
+
+        if (output.isSuccess()) {
+            context.setReviewReport(output.getReport());
+            try {
+                String rawJson = objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(output.getReport());
+                return AgentExecutionResult.builder()
+                        .success(true)
+                        .outputData(rawJson)
+                        .summary(output.getSummary())
+                        .executionTimeMs(output.getExecutionDurationMs())
+                        .build();
+            } catch (Exception e) {
+                return AgentExecutionResult.builder()
+                        .success(true)
+                        .summary(output.getSummary())
+                        .executionTimeMs(output.getExecutionDurationMs())
+                        .build();
+            }
+        } else {
             return AgentExecutionResult.builder()
                     .success(false)
-                    .errorMessage(e.getMessage())
-                    .executionTimeMs(duration)
+                    .errorMessage(output.getErrorMessage())
+                    .executionTimeMs(output.getExecutionDurationMs())
                     .build();
         }
     }
